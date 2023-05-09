@@ -1,0 +1,368 @@
+//Aisling Viets
+//CPE 301 Final Project
+
+//Libraries
+#include <Adafruit_Sensor.h>
+#include "DHT.h"
+#include "RTClib.h"
+#include <Wire.h>
+#include <LiquidCrystal.h>
+#include <Stepper.h>
+#include <string.h>
+
+//Macros
+#define DHTTYPE DHT11
+#define DHTPIN 52
+#define RDA 0x80
+#define TBE 0x20
+#define MIN_TEMP 60
+#define MIN_HUMID 30
+#define STEPS 100
+
+//Registers
+volatile unsigned char* pinb = (unsigned char*) 0x23;
+volatile unsigned char* ddrb = (unsigned char*) 0x24;
+volatile unsigned char* portb = (unsigned char*) 0x25;
+volatile unsigned char* pinc = (unsigned char*) 0x26;
+volatile unsigned char* ddrc = (unsigned char*) 0x27;
+volatile unsigned char* portc = (unsigned char*) 0x28;
+volatile unsigned char* pinf = (unsigned char*) 0x2F;
+volatile unsigned char* ddrf = (unsigned char*) 0x30;
+volatile unsigned char* portf = (unsigned char*) 0x31;
+
+//Serial
+volatile unsigned char* myUCSR0A = (unsigned char*)0x00C0;
+volatile unsigned char* myUCSR0B = (unsigned char*)0x00C1;
+volatile unsigned char* myUCSR0C = (unsigned char*)0x00C2;
+volatile unsigned int* myUBRR0  = (unsigned int*) 0x00C4;
+volatile unsigned char* myUDR0   = (unsigned char*)0x00C6;
+ 
+//Analog
+volatile unsigned char* my_ADMUX = (unsigned char*) 0x7C;
+volatile unsigned char* my_ADCSRB = (unsigned char*) 0x7B;
+volatile unsigned char* my_ADCSRA = (unsigned char*) 0x7A;
+volatile unsigned int* my_ADC_DATA = (unsigned int*) 0x78;
+
+//ISR
+volatile unsigned char* my_PCICR = (unsigned char*) 0x68;
+volatile unsigned char* my_PCMSK0 = (unsigned char*) 0x6B;
+
+//Timer
+volatile unsigned char* myTCCR4A = (unsigned char*) 0xA0;
+volatile unsigned char* myTCCR4B = (unsigned char*) 0xA1;
+volatile unsigned char* myTCCR4C = (unsigned char*) 0xA2;
+unsigned int* myTCNT4 = (unsigned int*) 0xA4;
+volatile unsigned char* myTIFR4 = (unsigned char*) 0x39;
+volatile unsigned char* myTIMSK4 = (unsigned char*) 0x72;
+
+//DHT
+DHT dht(DHTPIN, DHTTYPE);
+
+//RTC
+RTC_DS1307 rtc;
+volatile int i = 0;
+volatile unsigned int state = 0; //state control, 0 = DISABLED, 1 = IDLE, 2 = RUNNING, ELSE = ERROR
+
+//LCD
+const int rs = 62, en = 63, d4 = 64, d5 = 65, d6 = 66, d7 = 67; //LCD pin connections
+LiquidCrystal lcd(rs, en, d4, d5, d6, d7); //setup for LCD
+
+//Stepper
+Stepper steppermotor(STEPS, 49, 47, 46, 48);
+
+//Other/main functionality
+volatile float temp = MIN_TEMP, humid = MIN_HUMID;
+unsigned long start = 0; //for the timer
+const long interval = 6000; //interval for how often the swamp cooler can change state
+const int waterLevelPin = A0;
+const float maxVoltage = 5.0, minVoltage = 1.0, maxWaterLevel = 100, minWaterLevel = 50; //minimum and maximum voltages and water level percentages, adjust minWaterLevel to configure accepted water level
+
+//State functions
+void runningState();
+void idleState();
+void disabledState();
+void errorState();
+//Controls
+int waterLevel();
+void moveVent();
+void yellowLED();
+void greenLED();
+void redLED();
+void blueLED();
+void toggleFan(bool input);
+//UART
+void U0init(unsigned long U0baud);
+void U0putchar(unsigned char data);
+//Printing
+void myserialprintln(String s);
+String myrtcprint();
+//ADC
+void adc_init();
+unsigned adc_read(unsigned char adc_channel_num);
+//Useful
+void getWaterLevel();
+
+void setup(){
+  *ddrb &= 0x11011111; //set PB5 to input
+  *portb |= 0b00100000; //pullup for PB5
+  *ddrc |= 0b11110000; //set PC4-7 to output (LED)
+  //SERVO
+  *ddrf &= 0b11100100; //set PF0-4 to input
+  *portf |= 0b00011011; //pullup resistors for F
+  *ddrf |= 0b00000100; //set PF2 to output
+
+  *my_PCICR |= 1 << PCIE0;
+  *my_PCMSK0 |= 1 << PCINT5;
+
+  //Initialize LCD Display
+  lcd.begin(16, 2);
+  lcd.setCursor(0, 0);
+  lcd.print("Swamp Cooler");
+  lcd.setCursor(0, 1);
+  lcd.print("Starting...");
+
+  dht.begin(); //DHT
+  rtc.begin(); //RTC
+  *myTIMSK4 |= 0b00000001; //Set timer LSB to 1 to enable timer interrupts
+  adc_init(); //ADC
+  U0init(9600); //Serial monitor
+}
+
+void loop(){
+  unsigned long currentMillis = millis();
+  if(currentMillis - start >= interval){
+    if(state = 0){ //DISABLED
+      myserialprintln("State changed to DISABLED at: ");
+      myrtcprint();
+      myserialprintln("\n");
+      disabledState();
+    }
+    else if(state = 1){ //IDLE
+      myserialprintln("State changed to IDLE at: ");
+      myrtcprint();
+      myserialprintln("\n");
+      idleState();
+    }
+    else if(state = 2){ //RUNNING
+      myserialprintln("State changed to RUNNING at: ");
+      myrtcprint();
+      myserialprintln("\n");
+      runningState();
+    }
+    else{ //ERROR
+      myserialprintln("State changed to ERROR at: ");
+      myrtcprint();
+      myserialprintln("\n");
+      errorState();
+    }
+  }
+}
+
+int waterLevel(){
+  float voltage = adc_read(waterLevelPin) * (maxVoltage / 1023.0);
+  float waterLevel = (voltage - minVoltage) * (maxWaterLevel - minWaterLevel); //conversion from voltage to water level
+  return waterLevel; //returns percentage of water
+}
+
+void moveVent(){
+  if(!(*pinf & 0b00100000))
+  {
+   steppermotor.setSpeed(100);
+   steppermotor.step(2);
+  }
+  if(!(*pinf & 0x02))
+  {
+   steppermotor.setSpeed(100);
+   steppermotor.step(-2);
+  }
+}
+
+String myrtcprint(){
+  float h = rtc.now().hour();
+  float m = rtc.now().minute();
+  String hour = String(h, DEC);
+  String minute = String(m, DEC);
+  myserialprintln(hour);
+  myserialprintln(":");
+  myserialprintln(minute);
+  if(rtc.now().isPM()){
+    myserialprintln(" PM");
+  }
+  else{
+    myserialprintln(" AM");
+  }
+}
+
+void yellowLED(){
+  *portc |= 0b10000000;
+  *portc &= 0b01111111;
+}
+void greenLED(){
+  *portc |= 0b01000000;
+  *portc &= 0b10111111;
+}
+void redLED(){
+  *portc |= 0b00100000;
+  *portc &= 0b11011111;
+}
+void blueLED(){
+  *portc |= 0b00010000;
+  *portc &= 0b11101111;
+}
+
+void runningState(){
+  toggleFan(true);
+  temp = dht.readTemperature(true);
+  humid = dht.readHumidity();
+  blueLED();
+  moveVent();
+  lcd.clear();
+  lcd.print("T: ");
+  lcd.print(temp);
+  lcd.print(" H: ");
+  lcd.print(humid);
+  lcd.setCursor(0, 1);
+  lcd.print("State: Running");
+  if(temp < MIN_TEMP){
+    state = 1;
+  }
+  if(!(*pinf & 0b00001000)){ //off button
+    state = 0;
+  }
+  if(adc_read(0) < minWaterLevel){
+    state = 3;
+  }
+}
+
+void idleState(){
+  toggleFan(false);
+  temp = dht.readTemperature(true);
+  humid = dht.readHumidity();
+  greenLED();
+  moveVent();
+  lcd.clear();
+  lcd.print("T: ");
+  lcd.print(temp);
+  lcd.print(" H: ");
+  lcd.print(humid);
+  lcd.setCursor(0, 1);
+  lcd.print("State: Idle");
+  if(temp > MIN_TEMP){
+    state = 2;
+  }
+  if(adc_read(0) < minWaterLevel){
+    state = 3;
+  }
+}
+
+void disabledState(){
+  toggleFan(false);
+  yellowLED();
+  lcd.setCursor(0, 0);
+  lcd.print("Swamp Cooler");
+  lcd.setCursor(0, 1);
+  lcd.print("State: Disabled");
+  moveVent();
+}
+
+void errorState(){
+  toggleFan(false);
+  redLED(); //Turn on red LED
+  moveVent();
+  lcd.clear();
+  lcd.print("ERROR");
+  lcd.setCursor(0,1);
+  lcd.print("Add water");
+  if(!(*pinf & 0b00010000)){
+    if(adc_read(0) > minWaterLevel){
+      state = 1;
+    }
+  }
+}
+
+void toggleFan(bool input){ //fan
+  if (input){
+    *portf |= 0b00000100;
+  }
+  else{
+    *portf |= 0b11111011;
+  }
+}
+
+void U0init(unsigned long U0baud){ //from UART lab
+  unsigned long FCPU = 16000000;
+  unsigned int tbaud;
+  tbaud = (FCPU / 16 / U0baud - 1);
+  *myUCSR0A = 0x20;
+  *myUCSR0B = 0x18;
+  *myUCSR0C = 0x06;
+  *myUBRR0  = tbaud;
+}
+
+void myserialprintln(String s){
+  for (auto c : s){
+    U0putchar(c);
+  }
+}
+
+void U0putchar(unsigned char data){
+  while(!(TBE & *myUCSR0A));
+  *myUDR0 = data;
+}
+
+void adc_init() //from ADC lab
+{
+  // setup the A register
+  *my_ADCSRA |= 0b10000000; // set bit   7 to 1 to enable the ADC
+  *my_ADCSRA &= 0b11011111; // clear bit 6 to 0 to disable the ADC trigger mode
+  *my_ADCSRA &= 0b11110111; // clear bit 5 to 0 to disable the ADC interrupt
+  *my_ADCSRA &= 0b11111000; // clear bit 0-2 to 0 to set prescaler selection to slow reading
+  // setup the B register
+  *my_ADCSRB &= 0b11110111; // clear bit 3 to 0 to reset the channel and gain bits
+  *my_ADCSRB &= 0b11111000; // clear bit 2-0 to 0 to set free running mode
+  // setup the MUX Register
+  *my_ADMUX  &= 0b01111111; // clear bit 7 to 0 for AVCC analog reference
+  *my_ADMUX  |= 0b01000000; // set bit   6 to 1 for AVCC analog reference
+  *my_ADMUX  &= 0b11011111; // clear bit 5 to 0 for right adjust result
+  *my_ADMUX  &= 0b11100000; // clear bit 4-0 to 0 to reset the channel and gain bits
+}
+
+unsigned int adc_read(unsigned char adc_channel_num) //from ADC lab
+{
+  // clear the channel selection bits (MUX 4:0)
+  *my_ADMUX  &= 0b11100000;
+  // clear the channel selection bits (MUX 5)
+  *my_ADCSRB &= 0b11110111;
+  // set the channel number
+  if(adc_channel_num > 7)
+  {
+    // set the channel selection bits, but remove the most significant bit (bit 3)
+    adc_channel_num -= 8;
+    // set MUX bit 5
+    *my_ADCSRB |= 0b00001000;
+  }
+  // set the channel selection bits
+  *my_ADMUX  += adc_channel_num;
+  // set bit 6 of ADCSRA to 1 to start a conversion
+  *my_ADCSRA |= 0x40;
+  // wait for the conversion to complete
+  while((*my_ADCSRA & 0x40) != 0);
+  // return the result in the ADC data register
+  return *my_ADC_DATA;
+}
+
+//INTERRUPTS
+
+//ISR for timer
+ISR(TIMER4_OVF_vect)
+{
+  *myTCCR4B = 0x00; //disable timer
+  i++;
+  if(i == 60)
+  {
+   i = 0;
+  }
+  *myTCNT4 = 3036; //reset timer
+  *myTCCR4A = 0; //set to default state
+  *myTCCR4B = 0b00000100; //start timer
+}
